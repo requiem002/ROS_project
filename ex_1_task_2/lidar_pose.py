@@ -2,38 +2,65 @@
 
 import rospy
 from geometry_msgs.msg import Twist
-#from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Pose
+from sensor_msgs.msg import LaserScan
 from demo_programs.msg import prox_sensor  # Custom message for proximity sensors
 from demo_programs.msg import line_sensor
-from sensor_msgs.msg import Image
-import logging
 from std_msgs.msg import String
+import tf
 
 class RobotController:
     def __init__(self):
         # Initialize ROS
         rospy.init_node('robot_controller', anonymous=True)
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-        self.log_pub = rospy.Publisher('/log', String, queue_size =10 )
         rospy.Subscriber('/cop/prox_sensors', prox_sensor, self.proximity_callback)
         rospy.Subscriber('/cop/line_sensors', line_sensor, self.line_callback)
-        rospy.Subscriber('cop/rgb_image', Image, self.image_callback)
+        rospy.Subscriber('/hokuyo', LaserScan, self.lidar_callback)
+        rospy.Subscriber('/cop/pose', Pose, self.pose_callback)
+        self.log_pub = rospy.Publisher('/log', String, queue_size =10 )
         self.rate = rospy.Rate(10)
         self.vel_msg = Twist()
+        self.pose_data = None
         self.prox_data = None
         self.line_data = None
-        self.image_data = None
-        self.state = "MOVE_FORWARD"  # Initial state
-        self.prev_state = None
+        self.lidar_data = None
+        self.state = "PATH_PLANNING"  # Initial state
         self.obstacle_timer = 0
         self.direction = 'RIGHT'
         self.turn_direction = 0.5
         self.turn_counter = 0
+        self.current_angle = 0.0  # Initialize with zero heading
         self.reorient_counter = 0
         self.REORIENT_THRESHOLD = 15  # Adjust this value as needed
         self.prev_turn_direction = 0.0
-    def image_callback(self,data):
-        self.image_data = data
+        self.prev_state = 0
+        
+        
+    def quaternion_to_yaw(self,quaternion):
+        """
+        Converts a quaternion to yaw (rotation around z-axis).
+        :param quaternion: geometry_msgs.msg.Quaternion
+        :return: yaw angle in radians
+        """
+        
+        orientation_list = [quaternion.x, quaternion.y, quaternion.z, quaternion.w]
+        _, _, yaw = tf.transformations.euler_from_quaternion(orientation_list)
+        return yaw
+        
+    def pose_callback(self, data):
+        
+        orientation = data.orientation
+        yaw = self.quaternion_to_yaw(orientation)  # Get yaw angle
+        
+        if not hasattr(self, 'initial_yaw'):  # Store initial yaw on first callback
+            self.initial_yaw = yaw
+        
+        self.current_angle = self.normalize_angle(yaw - self.initial_yaw)
+        
+        
+    def lidar_callback(self,data):
+        self.lidar_data = data
     def line_callback(self,data):
         self.line_data = data
 
@@ -67,9 +94,9 @@ class RobotController:
         self.cmd_vel_pub.publish(self.vel_msg)
         
         if angular_speed > 0:
-            self.turn_counter += 1
+            self.turn_counter += 0.5
         else:
-            self.turn_counter -= 1
+            self.turn_counter -= 0.5
             
     def front_ll_clear(self):
         
@@ -101,28 +128,85 @@ class RobotController:
         else:
             return 0
         
+    def find_longest_lidar_direction(self):
+        
+        if not self.lidar_data:
+            return None
+        
+        ranges = self.lidar_data.ranges
+        max_distance = max(ranges)
+        max_index = ranges.index(max_distance)
+        angle_increment = self.lidar_data.angle_increment
+        angle = max_index * angle_increment + self.lidar_data.angle_min
+        
+        return angle
+    
+    def normalize_angle(self,angle):
+        while angle > 3.14159:  # π
+            angle -= 2 * 3.14159
+        while angle < -3.14159:  # -π
+            angle += 2 * 3.14159
+        return angle
+    
+    def rotate_toward_angle(self, target_angle):
+        """
+        Rotates the robot toward the specified target angle using normalized, relative yaw.
+        """
+        angle_diff = self.normalize_angle(target_angle - self.current_angle)
+    
+        rospy.loginfo(f"Target angle: {target_angle:.4f}, Current angle:{self.current_angle:.4f},diff: {angle_diff:.4f}")
+    
+        if abs(angle_diff) > 0.3:  # Large angle difference
+            angular_speed = -0.2 if angle_diff > 0 else 0.2
+        elif abs(angle_diff) > 0.05:  # Small angle difference
+            angular_speed = -0.05 if angle_diff > 0 else 0.05
+        else:
+            rospy.loginfo("Aligned with target angle.")
+            self.state = "MOVE_FORWARD"
+            return
+        self.stop()
+        self.rotate(angular_speed)
+        
+        
 
     def run(self):
         while not rospy.is_shutdown():
             
             if self.state != self.prev_state:
                 self.log_pub.publish(f"State: {self.state}")
+                
                 self.prev_state = self.state  # Update the previous state
 
-            if not self.prox_data:
+            if not self.prox_data and not self.pose_data:
                 continue  # Wait for sensor data
                 
             # Validate individual sensor readings
             if self.prox_data.prox_front is None:
                 continue  # or set to default value
+                
             
+            if self.state == "PATH_PLANNING":
+                target_angle = self.find_longest_lidar_direction()
+                
+                if target_angle is not None:
+                        self.target_angle = target_angle
+                        self.state = "ROTATE_TOWARD_LIDAR"
+                        
+                else:
+                        self.state == "MOVE_FORWARD"
+                
             # State machine
-            if self.state == "MOVE_FORWARD":
+            elif self.state == "MOVE_FORWARD":
 
                 if self.is_obstacle_detected() or self.is_side_obstacle_detected():
                     self.state = "AVOID_OBSTACLE"
                 else:
+                
                     self.move_forward()
+                    
+            elif self.state == "ROTATE_TOWARD_LIDAR":
+                if self.target_angle is not None:
+                    self.rotate_toward_angle(self.target_angle)
                 
             elif self.state == "AVOID_OBSTACLE":                
                 
@@ -139,11 +223,10 @@ class RobotController:
                 self.obstacle_timer +=1
                 self.rotate(angular_speed = self.turn_direction)
                 
-                if self.obstacle_timer > 50:
+                if self.obstacle_timer > 100:
                     self.state = "STUCK"
                     
                 elif self.direction == "RIGHT" and self.front_ll_clear():
-                    #rospy.loginfo("Clear on the left, move forward")
                     self.state = "POST_ROTATION"
                     
                 elif self.direction == "LEFT" and self.front_rr_clear():
@@ -173,22 +256,9 @@ class RobotController:
                     self.reorient_counter = 0  # Reset the counter
                     
             elif self.state == "REORIENT":
-                
-                if self.is_obstacle_detected():
-                    self.log_pub.publish(f"Obstacle detected during reorientation.")
-                    
-                    self.state = "AVOID_OBSTACLE"
+                target_angle = 0.0  # Assuming "north" is 0 radians
+                self.rotate_toward_angle(target_angle)
 
-                elif self.turn_counter != 0:
-                    local_direction = -0.4 if self.turn_counter > 0 else 0.4
-                    self.rotate(angular_speed = local_direction)
-                    
-                else:
-                    self.log_pub.publish(f"Reoriented north, proceeding onwards.")
-                    self.state = "MOVE_FORWARD"
-                    self.obstacle_timer = 0
-        
-                
             elif self.state == "STUCK":
                 self.stop()
                 self.log_pub.publish(f"Robot stuck. Reversing from obstacle.")
